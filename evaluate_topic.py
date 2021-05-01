@@ -33,6 +33,7 @@ def main(args):
 
     checkpoint = torch.load(args.ckpt, map_location=args.device)
     model_args = checkpoint['args']
+    model_args.iw = False
     conditioning_model = Model(model_args, gpt_pad_id, len(dataset_info.index2word)) # no need to get the glove embeddings when reloading since they're saved in model ckpt anyway
     conditioning_model.load_state_dict(checkpoint['state_dict'])
     conditioning_model = conditioning_model.to(args.device)

@@ -4,6 +4,9 @@ import os
 import pickle
 from collections import defaultdict, namedtuple
 import string
+from datasets import load_dataset
+from looping import LoopingDataset
+from torch.utils.data import Dataset as TorchDataset
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false' # turn off since we're using multiple threads for loading anyway
 
@@ -16,10 +19,12 @@ from util import suppress_stdout
 from poetry_util import is_iambic, count_syllables, get_rhymes, get_rhyme_group
 from constants import *
 
+
 DatasetInfo = namedtuple('DatasetInfo', 
                 ['index2word', 'word2index', 'total_words', 'vocab', 'glove_embeddings'])
 RhymeInfo = namedtuple('RhymeInfo', 
                 ['word2rhyme_group', 'rhyme_group_counts', 'rhyme_groups', 'index2rhyme_group', 'rhyme_group2index', 'total_rhyme_groups'])
+
 
 def collate(batch):
     pad_id = batch[0][4]
@@ -76,6 +81,110 @@ def load_rhyme_info(index2word, vocab):
                      total_rhyme_groups=total_rhyme_groups)
 
 
+class SplitDataset(TorchDataset):
+    def __init__(self, args, split='train', shuffle=True):
+        self.args = args
+        self.split = split
+        self.perc = args.perc
+        self.shuffle = shuffle
+
+        self.tokenizer = AutoTokenizer.from_pretrained(TOPIC_MODEL_STRING)
+        self.tokenizer.add_special_tokens({'pad_token': PAD_TOKEN})
+        self.gpt_pad_id = self.tokenizer.encode(PAD_TOKEN)[0] # actually just the vocab size
+        self.vocab = defaultdict(lambda: 0)
+        self.target_vocab = defaultdict(lambda: 0)
+
+        # self.dataset_name = args.dataset_name
+        # self.task = args.task
+        full_source_data = self.load_data_path(args.source_dir, split, 'source')
+        full_target_data = self.load_data_path(args.target_dir, split, 'target')
+        self.source_data, self.target_data = self.initialize_data_splits(full_source_data, full_target_data, split)
+
+        self.source_labels = torch.zeros(len(self.source_data))
+        self.target_labels = torch.ones(len(self.target_data))
+        print('len(self.vocab): ', len(self.vocab))
+    
+    def load_data_path(self, path, split, domain):
+        if domain == 'source':
+            # data = load_dataset('scientific_papers', 'arxiv', cache_dir='./arxiv', split=split)
+            data = load_dataset('text', data_files='/atlas/u/madeline/naacl-2021-fudge-controlled-generation/train_data/gpt2_generations/out.txt')
+            data = data['train'].train_test_split(test_size=0.2)[split]
+            return data
+        elif domain == 'target':
+            data = load_dataset('yelp_polarity', cache_dir='/atlas/u/madeline/naacl-2021-fudge-controlled-generation/topic_data/yelp', split=split)
+        else:
+            raise NotImplementedError
+        return data
+
+    def initialize_data_splits(self, full_source_data, full_target_data, split):
+        min_size = min(len(full_source_data), len(full_target_data))
+        if split == 'train':
+            num_source_samples = min_size
+            num_target_samples = int(self.perc * min_size)
+        else:
+            num_source_samples = num_target_samples = min_size
+            
+        source_idxs = random.sample(range(len(full_source_data)), num_source_samples)
+        target_idxs = random.sample(range(len(full_target_data)), num_target_samples)
+        
+        new_source_data = full_source_data.select(source_idxs)
+        # print(type(full_target_data['abstract']))
+        # new_target_data = np.array(full_target_data['abstract'])[target_idxs]
+        new_target_data = full_target_data.select(target_idxs)
+
+        if self.shuffle:
+            new_source_data = new_source_data.shuffle()
+            new_target_data = new_target_data.shuffle()
+
+        for seq in new_source_data:
+            for word in seq['text'].strip().split(' '):
+                self.vocab[word] += 1
+        for i, seq in enumerate(new_target_data['text']):
+            if seq.isspace():
+                new_target_data['text'].pop(i)
+                continue
+            new_seq = seq
+            
+            for word in seq.strip().split(' '):
+                # remove bad or numerical tokens
+                if '@' in word:
+                    new_seq = new_seq.replace(word, '')
+                else:
+                    self.vocab[word] += 1
+                    self.target_vocab[word] +=1
+        new_target_data['text'][i] = new_seq
+        sorted_words = sorted(self.target_vocab.keys(), key=lambda x: self.target_vocab[x], reverse=True)
+        for i in range(len(sorted_words)):
+            sorted_words[i] = sorted_words[i] + '\n'
+        with open(f"yelp_sorted_vocab_{split}.txt", 'w+') as f:
+            f.writelines(sorted_words)
+        return LoopingDataset(new_source_data['text']), LoopingDataset(new_target_data['text'])
+        
+    def __getitem__(self, index):
+        source_sample, target_sample = self.source_data[index], self.target_data[index]
+        # source_label, target_label = self.source_labels[index], self.target_labels[index]
+        
+        while len(source_sample) <= 0 or len(target_sample) <= 0:
+            index = np.random.choice(len(self.source_data))
+            source_sample, target_sample = self.source_data[index], self.target_data[index]
+
+        source_sample = self.tokenizer.encode(source_sample, return_tensors='pt')[0][:100]
+        target_sample = self.tokenizer.encode(target_sample, return_tensors='pt')[0][:100]
+        
+        source_length = len(source_sample)
+        target_length = len(target_sample)   
+
+        if source_length < 100:
+            source_sample = torch.cat([source_sample, torch.zeros(100 - source_length).long()], dim=0) 
+        if target_length < 100:
+            target_sample = torch.cat([target_sample, torch.zeros(100 - target_length).long()], dim=0)
+
+        return (source_sample, source_length), (target_sample, target_length)
+        #return (source_sample, source_label), (target_sample, target_label)
+    
+    def __len__(self):
+        return len(self.source_data) + len(self.target_data)
+
 class Dataset:
     def __init__(self, args):
         print('loading data')
@@ -112,6 +221,7 @@ class Dataset:
                         test.append((line.strip(), label))
             self.splits = {}
             self.splits['train'], self.splits['val'], self.splits['test'] = train, val, test
+            
         else: # topic / poetry
             for root, _, filenames in os.walk(args.data_dir):
                 for fname in filenames:

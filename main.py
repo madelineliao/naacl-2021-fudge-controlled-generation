@@ -9,8 +9,9 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
-from data import Dataset
+from data import Dataset, SplitDataset
 from model import Model
 from util import save_checkpoint, ProgressMeter, AverageMeter, num_params, pad_mask
 from constants import *
@@ -18,56 +19,50 @@ from constants import *
 
 def train(model, dataset, optimizer, criterion, epoch, args, data_start_index):
     model.train()
-    if data_start_index == 0:
-        dataset.shuffle('train', seed=epoch + args.seed)
-    if args.epoch_max_len is not None:
-        data_end_index = min(data_start_index + args.epoch_max_len, len(dataset.splits['train']))
-        loader = dataset.loader('train', num_workers=args.num_workers, indices=list(range(data_start_index, data_end_index)))
-        data_start_index = data_end_index if data_end_index < len(dataset.splits['train']) else 0
+    if args.iw:
+        loader = DataLoader(dataset, batch_size=args.batch_size//2)
+        loss_meter = AverageMeter('loss', ':6.4f')
+        acc_meter = AverageMeter('acc', ':6.4f')
+        total_length = len(loader)
+        progress = ProgressMeter(total_length, [loss_meter, acc_meter], prefix='Training: ')
+
+        for batch_num, ((x_source, source_lengths),(x_target, target_lengths)) in enumerate(tqdm(iter(loader), total=len(loader), leave=False)):
+            x = torch.cat([x_source, x_target]).to(args.device).long()
+            y_source = torch.cat([torch.cat([torch.zeros(source_lengths[i]), -torch.ones(100 - source_lengths[i])]).unsqueeze(0) for i in range(source_lengths.shape[0])], dim=0)
+            y_target = torch.cat([torch.cat([torch.ones(target_lengths[i]), -torch.ones(100 - target_lengths[i])]).unsqueeze(0) for i in range(target_lengths.shape[0])], dim=0)
+            y = torch.cat([y_source,y_target]).float().to(args.device)
+            
+            lengths = torch.cat([source_lengths, target_lengths]).squeeze().to(args.device)
+            scores = model(x, lengths)
+            use_indices = y.flatten() != -1
+            loss = criterion(scores.flatten()[use_indices], y.flatten().float()[use_indices])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            preds = torch.round(torch.sigmoid(scores.flatten()[use_indices]))
+            accs = sum(preds == y.flatten()[use_indices])/y.flatten()[use_indices].shape[0]
+            acc_meter.update(accs.detach(), y.shape[0])
+            loss_meter.update(loss.detach(), y.shape[0])
+            if batch_num % args.train_print_freq == 0:
+                progress.display(batch_num)
+        progress.display(total_length)
     else:
-        loader = dataset.loader('train', num_workers=args.num_workers)
-    loss_meter = AverageMeter('loss', ':6.4f')
-    total_length = len(loader)
-    progress = ProgressMeter(total_length, [loss_meter], prefix='Training: ')
-    for batch_num, batch in enumerate(tqdm(loader, total=len(loader))):
-        batch = [tensor.to(args.device) for tensor in batch]
-        inputs, lengths, future_words, log_probs, labels, classification_targets, syllables_to_go, future_word_num_syllables, rhyme_group_index = batch
-        if args.task not in ['formality', 'iambic']:
-            if not args.debug and len(inputs) != args.batch_size: # it'll screw up the bias...?
-                continue
-        scores = model(inputs, lengths, future_words, log_probs, syllables_to_go, future_word_num_syllables, rhyme_group_index, run_classifier=True)
-        if args.task == 'formality': # we're learning for all positions at once. scores are batch x seq
-            expanded_labels = classification_targets.unsqueeze(1).expand(-1, scores.shape[1]) # batch x seq
-            length_mask = pad_mask(lengths).permute(1, 0) # batch x seq
-            loss = criterion(scores.flatten()[length_mask.flatten()==1], expanded_labels.flatten().float()[length_mask.flatten()==1])
-        elif args.task in ['iambic', 'newline']:
-            use_indices = classification_targets.flatten() != -1
-            loss = criterion(scores.flatten()[use_indices], classification_targets.flatten().float()[use_indices])
-        else: # topic, rhyme
-            loss = criterion(scores.flatten(), labels.flatten().float())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        loss_meter.update(loss.detach(), len(labels))
-        if batch_num % args.train_print_freq == 0:
-            progress.display(batch_num)
-    progress.display(total_length)
-    return data_start_index
-
-
-def validate(model, dataset, criterion, epoch, args):
-    model.eval()
-    random.seed(0)
-    loader = dataset.loader('val', num_workers=args.num_workers)
-    loss_meter = AverageMeter('loss', ':6.4f')
-    total_length = len(loader)
-    progress = ProgressMeter(total_length, [loss_meter], prefix='Validation: ')
-    with torch.no_grad():
+        if data_start_index == 0:
+            dataset.shuffle('train', seed=epoch + args.seed)
+        if args.epoch_max_len is not None:
+            data_end_index = min(data_start_index + args.epoch_max_len, len(dataset.splits['train']))
+            loader = dataset.loader('train', num_workers=args.num_workers, indices=list(range(data_start_index, data_end_index)))
+            data_start_index = data_end_index if data_end_index < len(dataset.splits['train']) else 0
+        else:
+            loader = dataset.loader('train', num_workers=args.num_workers)
+        loss_meter = AverageMeter('loss', ':6.4f')
+        total_length = len(loader)
+        progress = ProgressMeter(total_length, [loss_meter], prefix='Training: ')
         for batch_num, batch in enumerate(tqdm(loader, total=len(loader))):
             batch = [tensor.to(args.device) for tensor in batch]
             inputs, lengths, future_words, log_probs, labels, classification_targets, syllables_to_go, future_word_num_syllables, rhyme_group_index = batch
-            if args.task not in ['formality', 'iambic']: # topic predictor
-                if not args.debug and len(inputs) != args.batch_size:
+            if args.task not in ['formality', 'iambic']:
+                if not args.debug and len(inputs) != args.batch_size: # it'll screw up the bias...?
                     continue
             scores = model(inputs, lengths, future_words, log_probs, syllables_to_go, future_word_num_syllables, rhyme_group_index, run_classifier=True)
             if args.task == 'formality': # we're learning for all positions at once. scores are batch x seq
@@ -79,77 +74,176 @@ def validate(model, dataset, criterion, epoch, args):
                 loss = criterion(scores.flatten()[use_indices], classification_targets.flatten().float()[use_indices])
             else: # topic, rhyme
                 loss = criterion(scores.flatten(), labels.flatten().float())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             loss_meter.update(loss.detach(), len(labels))
             if batch_num % args.train_print_freq == 0:
                 progress.display(batch_num)
-    progress.display(total_length)
-    return loss_meter.avg
+        progress.display(total_length)
+    return data_start_index
+
+
+def validate(model, dataset, criterion, epoch, args):
+    model.eval()
+    random.seed(0)
+    if args.iw:
+        loader = DataLoader(SplitDataset(args, split='test'), batch_size=args.batch_size//2)
+        loss_meter = AverageMeter('loss', ':6.4f')
+        acc_meter = AverageMeter('acc', ':6.4f')
+        total_length = len(loader)
+        progress = ProgressMeter(total_length, [loss_meter, acc_meter], prefix='Validation: ')
+        with torch.no_grad():
+            for batch_num, ((x_source, source_lengths),(x_target, target_lengths)) in enumerate(tqdm(iter(loader), total=len(loader), leave=False)):
+                x = torch.cat([x_source, x_target]).to(args.device).long()
+                y_source = torch.cat([torch.cat([torch.zeros(source_lengths[i]), -torch.ones(100 - source_lengths[i])]).unsqueeze(0) for i in range(source_lengths.shape[0])], dim=0)
+                y_target = torch.cat([torch.cat([torch.ones(target_lengths[i]), -torch.ones(100 - target_lengths[i])]).unsqueeze(0) for i in range(target_lengths.shape[0])], dim=0)
+                y = torch.cat([y_source,y_target]).float().to(args.device)
+
+                lengths = torch.cat([source_lengths, target_lengths]).squeeze().to(args.device)
+                scores = model(x, lengths)
+                use_indices = y.flatten() != -1
+                loss = criterion(scores.flatten()[use_indices], y.flatten().float()[use_indices])
+                preds = torch.round(torch.sigmoid(scores.flatten()[use_indices]))
+                
+                accs = sum(preds == y.flatten()[use_indices])/y.flatten()[use_indices].shape[0]
+                acc_meter.update(accs.detach(), y.shape[0])
+                loss_meter.update(loss.detach(), y.shape[0])
+                if batch_num % args.train_print_freq == 0:
+                    progress.display(batch_num)
+        progress.display(total_length)
+        return loss_meter.avg
+
+    else:
+        loader = dataset.loader('val', num_workers=args.num_workers)
+        loss_meter = AverageMeter('loss', ':6.4f')
+        total_length = len(loader)
+        progress = ProgressMeter(total_length, [loss_meter], prefix='Validation: ')
+        with torch.no_grad():
+            for batch_num, batch in enumerate(tqdm(loader, total=len(loader))):
+                batch = [tensor.to(args.device) for tensor in batch]
+                inputs, lengths, future_words, log_probs, labels, classification_targets, syllables_to_go, future_word_num_syllables, rhyme_group_index = batch
+                if args.task not in ['formality', 'iambic']: # topic predictor
+                    if not args.debug and len(inputs) != args.batch_size:
+                        continue
+                scores = model(inputs, lengths, future_words, log_probs, syllables_to_go, future_word_num_syllables, rhyme_group_index, run_classifier=True)
+                if args.task == 'formality': # we're learning for all positions at once. scores are batch x seq
+                    expanded_labels = classification_targets.unsqueeze(1).expand(-1, scores.shape[1]) # batch x seq
+                    length_mask = pad_mask(lengths).permute(1, 0) # batch x seq
+                    loss = criterion(scores.flatten()[length_mask.flatten()==1], expanded_labels.flatten().float()[length_mask.flatten()==1])
+                elif args.task in ['iambic', 'newline']:
+                    use_indices = classification_targets.flatten() != -1
+                    loss = criterion(scores.flatten()[use_indices], classification_targets.flatten().float()[use_indices])
+                else: # topic, rhyme
+                    loss = criterion(scores.flatten(), labels.flatten().float())
+                loss_meter.update(loss.detach(), len(labels))
+                if batch_num % args.train_print_freq == 0:
+                    progress.display(batch_num)
+        progress.display(total_length)
+        return loss_meter.avg
 
 
 def main(args):
-    dataset = Dataset(args)
-    os.makedirs(args.save_dir, exist_ok=True)
-    with open(os.path.join(args.save_dir, 'dataset_info'), 'wb') as wf:
-        pickle.dump(dataset.dataset_info, wf)
-    if args.task == 'rhyme':
-        with open(os.path.join(args.save_dir, 'rhyme_info'), 'wb') as wf:
-            pickle.dump(dataset.rhyme_info, wf)
-    if args.ckpt:
-        checkpoint = torch.load(args.ckpt, map_location=args.device)
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_metric = checkpoint['best_metric']
-        model_args = checkpoint['args']
-        model = Model(model_args, dataset.gpt_pad_id, len(dataset.index2word), rhyme_group_size=len(dataset.index2rhyme_group) if args.task == 'rhyme' else None) # no need to get the glove embeddings when reloading since they're saved in model ckpt anyway
-        model.load_state_dict(checkpoint['state_dict'])
-        model = model.to(args.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=model_args.lr)
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        data_start_index = checkpoint['data_start_index']
-        print("=> loaded checkpoint '{}' (epoch {})"
-                .format(args.ckpt, checkpoint['epoch']))
-        # NOTE: just import pdb after loading the model here if you want to play with it, it's easy
-        # model.eval()
-        # import pdb; pdb.set_trace()
-    else:
-        model = Model(args, dataset.gpt_pad_id, len(dataset.index2word), rhyme_group_size=len(dataset.index2rhyme_group) if args.task == 'rhyme' else None, glove_embeddings=dataset.glove_embeddings)
+    if args.iw:
+        dataset = SplitDataset(args, 'train')
+        model = Model(args, dataset.gpt_pad_id, len(dataset.vocab.keys())) 
         model = model.to(args.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         best_val_metric = 1e8 # lower is better for BCE
         data_start_index = 0
-    print('num params', num_params(model))
-    criterion = nn.BCEWithLogitsLoss().to(args.device)
-    
-    if args.evaluate:
-        epoch = 0
-        validate(model, dataset, criterion, epoch, args)
-        return
-    for epoch in range(args.epochs):
-        print("TRAINING: Epoch {} at {}".format(epoch, time.ctime()))
-        data_start_index = train(model, dataset, optimizer, criterion, epoch, args, data_start_index)
-        if epoch % args.validation_freq == 0:
-            print("VALIDATION: Epoch {} at {}".format(epoch, time.ctime()))
-            metric = validate(model, dataset, criterion, epoch, args)
+        print('num params', num_params(model))
+        criterion = nn.BCEWithLogitsLoss().to(args.device)
+        for epoch in range(args.epochs):
+            print("TRAINING: Epoch {} at {}".format(epoch, time.ctime()))
+            data_start_index = train(model, dataset, optimizer, criterion, epoch, args, data_start_index)
+            if epoch % args.validation_freq == 0:
+                print("VALIDATION: Epoch {} at {}".format(epoch, time.ctime()))
+                metric = validate(model, dataset, criterion, epoch, args)
 
-            if not args.debug:
-                if metric < best_val_metric:
-                    print('new best val metric', metric)
-                    best_val_metric = metric
+                if not args.debug:
+                    if metric < best_val_metric:
+                        print('new best val metric', metric)
+                        best_val_metric = metric
+                        save_checkpoint({
+                            'epoch': epoch,
+                            'state_dict': model.state_dict(),
+                            'best_metric': best_val_metric,
+                            'optimizer': optimizer.state_dict(),
+                            'data_start_index': data_start_index,
+                            'args': args
+                        }, os.path.join(args.save_dir, 'model_best.pth.tar'))
                     save_checkpoint({
                         'epoch': epoch,
                         'state_dict': model.state_dict(),
-                        'best_metric': best_val_metric,
+                        'best_metric': metric,
                         'optimizer': optimizer.state_dict(),
                         'data_start_index': data_start_index,
                         'args': args
-                    }, os.path.join(args.save_dir, 'model_best.pth.tar'))
-                save_checkpoint({
-                    'epoch': epoch,
-                    'state_dict': model.state_dict(),
-                    'best_metric': metric,
-                    'optimizer': optimizer.state_dict(),
-                    'data_start_index': data_start_index,
-                    'args': args
-                }, os.path.join(args.save_dir, 'model_epoch' + str(epoch) + '.pth.tar'))
+                    }, os.path.join(args.save_dir, 'model_epoch' + str(epoch) + '.pth.tar'))
+    else:
+        dataset = Dataset(args)
+        os.makedirs(args.save_dir, exist_ok=True)
+        with open(os.path.join(args.save_dir, 'dataset_info'), 'wb') as wf:
+            pickle.dump(dataset.dataset_info, wf)
+        if args.task == 'rhyme':
+            with open(os.path.join(args.save_dir, 'rhyme_info'), 'wb') as wf:
+                pickle.dump(dataset.rhyme_info, wf)
+        if args.ckpt:
+            checkpoint = torch.load(args.ckpt, map_location=args.device)
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_metric = checkpoint['best_metric']
+            model_args = checkpoint['args']
+            model = Model(model_args, dataset.gpt_pad_id, len(dataset.index2word), rhyme_group_size=len(dataset.index2rhyme_group) if args.task == 'rhyme' else None) # no need to get the glove embeddings when reloading since they're saved in model ckpt anyway
+            model.load_state_dict(checkpoint['state_dict'])
+            model = model.to(args.device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=model_args.lr)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            data_start_index = checkpoint['data_start_index']
+            print("=> loaded checkpoint '{}' (epoch {})"
+                    .format(args.ckpt, checkpoint['epoch']))
+            # NOTE: just import pdb after loading the model here if you want to play with it, it's easy
+            # model.eval()
+            # import pdb; pdb.set_trace()
+        else:
+            model = Model(args, dataset.gpt_pad_id, len(dataset.index2word), rhyme_group_size=len(dataset.index2rhyme_group) if args.task == 'rhyme' else None, glove_embeddings=dataset.glove_embeddings)
+            model = model.to(args.device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            best_val_metric = 1e8 # lower is better for BCE
+            data_start_index = 0
+        print('num params', num_params(model))
+        criterion = nn.BCEWithLogitsLoss().to(args.device)
+        
+        if args.evaluate:
+            epoch = 0
+            validate(model, dataset, criterion, epoch, args)
+            return
+        for epoch in range(args.epochs):
+            print("TRAINING: Epoch {} at {}".format(epoch, time.ctime()))
+            data_start_index = train(model, dataset, optimizer, criterion, epoch, args, data_start_index)
+            if epoch % args.validation_freq == 0:
+                print("VALIDATION: Epoch {} at {}".format(epoch, time.ctime()))
+                metric = validate(model, dataset, criterion, epoch, args)
+
+                if not args.debug:
+                    if metric < best_val_metric:
+                        print('new best val metric', metric)
+                        best_val_metric = metric
+                        save_checkpoint({
+                            'epoch': epoch,
+                            'state_dict': model.state_dict(),
+                            'best_metric': best_val_metric,
+                            'optimizer': optimizer.state_dict(),
+                            'data_start_index': data_start_index,
+                            'args': args
+                        }, os.path.join(args.save_dir, 'model_best.pth.tar'))
+                    save_checkpoint({
+                        'epoch': epoch,
+                        'state_dict': model.state_dict(),
+                        'best_metric': metric,
+                        'optimizer': optimizer.state_dict(),
+                        'data_start_index': data_start_index,
+                        'args': args
+                    }, os.path.join(args.save_dir, 'model_epoch' + str(epoch) + '.pth.tar'))
 
 
 if __name__=='__main__':
@@ -180,6 +274,12 @@ if __name__=='__main__':
 
     # PRINTING
     parser.add_argument('--train_print_freq', type=int, default=100, help='how often to print metrics (every X batches)')
+
+    # added
+    parser.add_argument('--perc', type=float, default=1.0, help='for importance weighting; size of target dset relative to source')
+    parser.add_argument('--source_dir', type=str, default='', help='path to source data')
+    parser.add_argument('--target_dir', type=str, default='', help='path to target data')
+    parser.add_argument('--iw', action='store_true', default=False, help='whether or not to do iw target dset setup')
 
     args = parser.parse_args()
 
